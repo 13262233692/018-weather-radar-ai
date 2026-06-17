@@ -47,3 +47,13 @@ class RadarInfoResponse(BaseModel):
     altitude: float
     scan_time: datetime
     variables: List[str]
+
+
+class SatelliteUploadResponse(BaseModel):
+    success: bool
+    message: str
+    frame_count: int = 0
+    satellite_id: Optional[str] = None
+    start_time: Optional[datetime] = None
+    end_time: Optional[datetime] = None
+    has_attention_mask: bool = False

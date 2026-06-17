@@ -60,3 +60,17 @@ visualization:
   colormap: "weather"
   dpi: 100
   format: "png"
+
+fusion:
+  enabled: true
+  mode: "hard_mask"
+  satellite_channels: 2
+  checkpoint_path: "./checkpoints/multimodal_convlstm.pth"
+
+fy4_satellite:
+  channels: ["IR1", "IR2"]
+  target_height: 256
+  target_width: 256
+  convective_temp_threshold: 220.0
+  min_weight: 0.1
+  max_weight: 3.0

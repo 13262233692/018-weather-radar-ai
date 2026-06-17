@@ -19,7 +19,9 @@ from .preprocessing.normalizer import RadarDataNormalizer
 from .preprocessing.dataloader import RadarDataLoader
 from .preprocessing.tensor_builder import TensorSequenceBuilder
 from .preprocessing.tensor_standardizer import TensorStandardizer
-from .models.convlstm_model import ConvLSTMModel
+from .satellite.fy4_parser import FY4DataParser
+from .satellite.preprocessor import SatellitePreprocessor
+from .models.multimodal_fusion import MultimodalConvLSTM, FusionMode
 from .inference.gpu_manager import GPUMemoryManager
 from .visualization.renderer import RadarImageRenderer
 
@@ -42,10 +44,17 @@ class WeatherRadarService:
             target_height=self.config.get("model", {}).get("img_height", 256),
             target_width=self.config.get("model", {}).get("img_width", 256),
         )
+        self.fy4_parser = FY4DataParser(self.config)
+        self.fy4_preprocessor = SatellitePreprocessor(
+            target_height=self.config.get("model", {}).get("img_height", 256),
+            target_width=self.config.get("model", {}).get("img_width", 256),
+            radar_range_km=self.config.get("radar", {}).get("max_range_km", 460),
+        )
         self.gpu_manager = GPUMemoryManager(self.config)
         self.renderer = RadarImageRenderer(self.config)
 
         model_cfg = self.config.get("model", {})
+        fusion_cfg = self.config.get("fusion", {})
         gpu_cfg = self.config.get("gpu", {})
 
         if gpu_cfg.get("device", "auto") == "auto":
@@ -54,8 +63,12 @@ class WeatherRadarService:
             device_str = gpu_cfg.get("device", "cpu")
         self.device = torch.device(device_str)
 
-        self.model = ConvLSTMModel(
-            input_channels=model_cfg.get("input_channels", 2),
+        self.use_satellite = fusion_cfg.get("enabled", True)
+        self.fusion_mode = fusion_cfg.get("mode", FusionMode.HARD_MASK)
+
+        self.model = MultimodalConvLSTM(
+            radar_channels=model_cfg.get("input_channels", 2),
+            satellite_channels=fusion_cfg.get("satellite_channels", 2),
             hidden_channels=model_cfg.get("hidden_channels", [64, 64, 64]),
             kernel_size=model_cfg.get("kernel_size", 3),
             num_layers=model_cfg.get("num_layers", 3),
@@ -63,27 +76,67 @@ class WeatherRadarService:
             output_seq_len=model_cfg.get("output_seq_len", 12),
             img_height=model_cfg.get("img_height", 256),
             img_width=model_cfg.get("img_width", 256),
+            fusion_mode=self.fusion_mode,
+            use_satellite=self.use_satellite,
         ).to(self.device)
 
-        checkpoint_path = model_cfg.get("checkpoint_path", "./checkpoints/convlstm_weather.pth")
-        if os.path.exists(checkpoint_path):
-            try:
-                checkpoint = torch.load(checkpoint_path, map_location=self.device)
-                if "model_state_dict" in checkpoint:
-                    self.model.load_state_dict(checkpoint["model_state_dict"])
-                else:
-                    self.model.load_state_dict(checkpoint)
-            except Exception:
-                pass
+        self._load_checkpoint()
         self.model.eval()
 
-    def _safe_predict(self, input_tensor: torch.Tensor) -> torch.Tensor:
+    def _load_checkpoint(self):
+        fusion_cfg = self.config.get("fusion", {})
+        model_cfg = self.config.get("model", {})
+
+        multimodal_checkpoint = fusion_cfg.get(
+            "checkpoint_path", "./checkpoints/multimodal_convlstm.pth"
+        )
+        if os.path.exists(multimodal_checkpoint):
+            try:
+                checkpoint = torch.load(multimodal_checkpoint, map_location=self.device)
+                if "model_state_dict" in checkpoint:
+                    self.model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+                else:
+                    self.model.load_state_dict(checkpoint, strict=False)
+                return
+            except Exception:
+                pass
+
+        radar_checkpoint = model_cfg.get(
+            "checkpoint_path", "./checkpoints/convlstm_weather.pth"
+        )
+        if os.path.exists(radar_checkpoint):
+            try:
+                checkpoint = torch.load(radar_checkpoint, map_location=self.device)
+                if "model_state_dict" in checkpoint:
+                    state_dict = checkpoint["model_state_dict"]
+                else:
+                    state_dict = checkpoint
+
+                encoder_keys = {}
+                for k, v in state_dict.items():
+                    if "encoder_layers" in k or "decoder_layers" in k or "output_conv" in k:
+                        encoder_keys[k] = v
+
+                self.model.load_state_dict(encoder_keys, strict=False)
+            except Exception:
+                pass
+
+    def _safe_predict(
+        self,
+        input_tensor: torch.Tensor,
+        satellite_tensor: Optional[torch.Tensor] = None,
+        hard_mask_tensor: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         standardized, meta = self.standardizer.standardize_tensor(input_tensor)
+
+        total_channels = standardized.size(2)
+        if satellite_tensor is not None:
+            total_channels += satellite_tensor.size(2)
 
         estimated_mb = self.gpu_manager.estimate_batch_memory_mb(
             batch_size=standardized.size(0),
             seq_len=standardized.size(1),
-            channels=standardized.size(2),
+            channels=total_channels,
             height=standardized.size(3),
             width=standardized.size(4),
             num_layers=len(self.model.encoder_layers),
@@ -97,11 +150,28 @@ class WeatherRadarService:
                     f"Free: {self.gpu_manager.get_stats().free_mb:.0f}MB"
                 )
 
+        sat_standardized = None
+        mask_standardized = None
+        sat_meta = None
+        mask_meta = None
+
+        if satellite_tensor is not None:
+            sat_standardized, sat_meta = self.standardizer.standardize_tensor(satellite_tensor)
+            sat_standardized = sat_standardized.to(self.device)
+
+        if hard_mask_tensor is not None:
+            mask_standardized, mask_meta = self.standardizer.standardize_tensor(hard_mask_tensor)
+            mask_standardized = mask_standardized.to(self.device)
+
         with self.gpu_manager.safe_inference_context():
             standardized = standardized.to(self.device)
             with torch.no_grad():
                 self.model.eval()
-                output = self.model(standardized)
+                output = self.model(
+                    standardized,
+                    satellite_tensor=sat_standardized,
+                    hard_mask_tensor=mask_standardized,
+                )
             output = output.cpu()
 
         restored = self.standardizer.restore_tensor(output, meta)
@@ -110,6 +180,7 @@ class WeatherRadarService:
     def process_files(
         self,
         file_paths: List[str],
+        satellite_file_paths: Optional[List[str]] = None,
         save_images: bool = False,
         output_dir: str = None,
     ) -> Dict:
@@ -117,11 +188,24 @@ class WeatherRadarService:
         if not frames:
             return {"success": False, "error": "Failed to load any radar frames"}
 
-        return self._process_frames(frames, save_images, output_dir)
+        satellite_frames = None
+        if satellite_file_paths and self.use_satellite:
+            satellite_frames = []
+            for f in satellite_file_paths:
+                try:
+                    data = self.fy4_parser.parse_file(f)
+                    satellite_frames.append(data)
+                except Exception:
+                    continue
+            if not satellite_frames:
+                satellite_frames = None
+
+        return self._process_frames(frames, satellite_frames, save_images, output_dir)
 
     def process_bytes(
         self,
         bytes_list: List[Tuple[str, bytes]],
+        satellite_bytes_list: Optional[List[Tuple[str, bytes]]] = None,
         save_images: bool = False,
         output_dir: str = None,
     ) -> Dict:
@@ -129,11 +213,24 @@ class WeatherRadarService:
         if not frames:
             return {"success": False, "error": "Failed to load any radar frames"}
 
-        return self._process_frames(frames, save_images, output_dir)
+        satellite_frames = None
+        if satellite_bytes_list and self.use_satellite:
+            satellite_frames = []
+            for filename, content in satellite_bytes_list:
+                try:
+                    data = self.fy4_parser.parse_bytes(content, filename)
+                    satellite_frames.append(data)
+                except Exception:
+                    continue
+            if not satellite_frames:
+                satellite_frames = None
+
+        return self._process_frames(frames, satellite_frames, save_images, output_dir)
 
     def _process_frames(
         self,
         frames: List[dict],
+        satellite_frames: Optional[List[dict]],
         save_images: bool,
         output_dir: Optional[str],
     ) -> Dict:
@@ -143,6 +240,7 @@ class WeatherRadarService:
             "radar_id": frames[0]["radar_id"],
             "start_time": frames[0]["timestamp"],
             "end_time": frames[-1]["timestamp"],
+            "used_satellite_fusion": False,
         }
 
         input_tensor = self.tensor_builder.build_input_tensor(frames)
@@ -154,8 +252,23 @@ class WeatherRadarService:
             )
             return result
 
+        satellite_tensor = None
+        hard_mask_tensor = None
+
+        if satellite_frames and self.use_satellite:
+            preprocessed = self.fy4_preprocessor.preprocess_for_fusion(
+                satellite_frames,
+                target_seq_len=self.tensor_builder.input_seq_len,
+                reference_times=[f["timestamp"] for f in frames],
+            )
+            satellite_tensor = preprocessed.get("satellite_tensor")
+            hard_mask_tensor = preprocessed.get("hard_mask_tensor")
+            if satellite_tensor is not None:
+                result["used_satellite_fusion"] = True
+                result["satellite_frame_count"] = len(satellite_frames)
+
         try:
-            output_tensor = self._safe_predict(input_tensor)
+            output_tensor = self._safe_predict(input_tensor, satellite_tensor, hard_mask_tensor)
         except RuntimeError as e:
             result["success"] = False
             result["error"] = str(e)
@@ -243,6 +356,7 @@ class WeatherRadarService:
     def get_prediction_preview(
         self,
         file_paths: List[str],
+        satellite_file_paths: Optional[List[str]] = None,
         frame_index: int = 0,
     ) -> Optional[bytes]:
         frames = self.dataloader.load_from_files(file_paths)
@@ -253,8 +367,28 @@ class WeatherRadarService:
         if input_tensor is None:
             return None
 
+        satellite_tensor = None
+        hard_mask_tensor = None
+
+        if satellite_file_paths and self.use_satellite:
+            satellite_frames = []
+            for f in satellite_file_paths:
+                try:
+                    data = self.fy4_parser.parse_file(f)
+                    satellite_frames.append(data)
+                except Exception:
+                    continue
+            if satellite_frames:
+                preprocessed = self.fy4_preprocessor.preprocess_for_fusion(
+                    satellite_frames,
+                    target_seq_len=self.tensor_builder.input_seq_len,
+                    reference_times=[f["timestamp"] for f in frames],
+                )
+                satellite_tensor = preprocessed.get("satellite_tensor")
+                hard_mask_tensor = preprocessed.get("hard_mask_tensor")
+
         try:
-            output_tensor = self._safe_predict(input_tensor)
+            output_tensor = self._safe_predict(input_tensor, satellite_tensor, hard_mask_tensor)
         except RuntimeError:
             return None
 

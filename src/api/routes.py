@@ -17,6 +17,7 @@ from fastapi.responses import Response, StreamingResponse
 
 from .schemas import (
     RadarUploadResponse,
+    SatelliteUploadResponse,
     PredictionResponse,
     PredictionFrameInfo,
     HealthResponse,
@@ -73,20 +74,61 @@ async def upload_radar_data(
     )
 
 
-@router.post("/predict", response_model=PredictionResponse)
-async def predict(
+@router.post("/upload_satellite", response_model=SatelliteUploadResponse)
+async def upload_satellite_data(
     files: List[UploadFile] = File(...),
     state: AppState = Depends(get_app_state),
 ):
     if not files:
-        raise HTTPException(status_code=400, detail="No input files")
+        raise HTTPException(status_code=400, detail="No files uploaded")
+
+    if state.fy4_parser is None or state.fy4_preprocessor is None:
+        raise HTTPException(status_code=503, detail="Satellite processing not initialized")
 
     bytes_list = []
     for file in files:
         content = await file.read()
         bytes_list.append((file.filename, content))
 
-    frames = state.dataloader.load_from_bytes_list(bytes_list)
+    satellite_frames = []
+    for filename, content in bytes_list:
+        try:
+            data = state.fy4_parser.parse_bytes(content, filename)
+            satellite_frames.append(data)
+        except Exception as e:
+            continue
+
+    if not satellite_frames:
+        raise HTTPException(status_code=400, detail="Failed to parse any satellite data")
+
+    preprocessed = state.fy4_preprocessor.preprocess_sequence(satellite_frames)
+
+    return SatelliteUploadResponse(
+        success=True,
+        message=f"Successfully loaded {len(satellite_frames)} satellite frames",
+        frame_count=len(satellite_frames),
+        satellite_id=satellite_frames[0].get("satellite_id", "FY-4"),
+        start_time=satellite_frames[0].get("timestamp"),
+        end_time=satellite_frames[-1].get("timestamp"),
+        has_attention_mask=preprocessed.get("attention_mask") is not None,
+    )
+
+
+@router.post("/predict", response_model=PredictionResponse)
+async def predict(
+    radar_files: List[UploadFile] = File(...),
+    satellite_files: List[UploadFile] = File(None),
+    state: AppState = Depends(get_app_state),
+):
+    if not radar_files:
+        raise HTTPException(status_code=400, detail="No radar input files")
+
+    radar_bytes_list = []
+    for file in radar_files:
+        content = await file.read()
+        radar_bytes_list.append((file.filename, content))
+
+    frames = state.dataloader.load_from_bytes_list(radar_bytes_list)
 
     if not frames:
         raise HTTPException(status_code=400, detail="Failed to parse radar data")
@@ -98,9 +140,37 @@ async def predict(
             detail=f"Insufficient frames. Need at least {state.tensor_builder.input_seq_len}",
         )
 
+    satellite_tensor = None
+    hard_mask_tensor = None
+
+    if satellite_files and state.use_satellite:
+        satellite_bytes_list = []
+        for file in satellite_files:
+            content = await file.read()
+            satellite_bytes_list.append((file.filename, content))
+
+        satellite_frames = []
+        for filename, content in satellite_bytes_list:
+            try:
+                data = state.fy4_parser.parse_bytes(content, filename)
+                satellite_frames.append(data)
+            except Exception:
+                continue
+
+        if satellite_frames and state.fy4_preprocessor is not None:
+            preprocessed = state.fy4_preprocessor.preprocess_for_fusion(
+                satellite_frames,
+                target_seq_len=state.tensor_builder.input_seq_len,
+                reference_times=[f["timestamp"] for f in frames],
+            )
+            satellite_tensor = preprocessed.get("satellite_tensor")
+            hard_mask_tensor = preprocessed.get("hard_mask_tensor")
+
     try:
         output_tensor = await state.batch_scheduler.submit(
             input_tensor,
+            satellite_tensor=satellite_tensor,
+            hard_mask_tensor=hard_mask_tensor,
             meta={"radar_id": frames[0]["radar_id"]},
         )
     except RuntimeError as e:
@@ -128,9 +198,13 @@ async def predict(
 
     end_time = start_time + timedelta(minutes=(output_seq_len - 1) * interval)
 
+    fusion_info = ""
+    if satellite_tensor is not None:
+        fusion_info = " with satellite fusion"
+
     return PredictionResponse(
         success=True,
-        message="Prediction completed",
+        message=f"Prediction completed{fusion_info}",
         input_frame_count=len(frames),
         output_frame_count=output_seq_len,
         start_time=start_time,
@@ -167,6 +241,7 @@ async def preview_single(
 @router.get("/preview/sequence")
 async def preview_prediction_sequence(
     files: List[str] = Query(..., description="List of input radar file paths"),
+    satellite_files: List[str] = Query(None, description="List of input satellite file paths"),
     format: str = Query("png", description="Output format: png, gif, zip"),
     state: AppState = Depends(get_app_state),
 ):
@@ -182,9 +257,36 @@ async def preview_prediction_sequence(
     if input_tensor is None:
         raise HTTPException(status_code=400, detail="Insufficient input frames")
 
+    satellite_tensor = None
+    hard_mask_tensor = None
+
+    if satellite_files and state.use_satellite:
+        for f in satellite_files:
+            if not os.path.exists(f):
+                raise HTTPException(status_code=404, detail=f"Satellite file not found: {f}")
+
+        satellite_frames = []
+        for f in satellite_files:
+            try:
+                data = state.fy4_parser.parse_file(f)
+                satellite_frames.append(data)
+            except Exception:
+                continue
+
+        if satellite_frames and state.fy4_preprocessor is not None:
+            preprocessed = state.fy4_preprocessor.preprocess_for_fusion(
+                satellite_frames,
+                target_seq_len=state.tensor_builder.input_seq_len,
+                reference_times=[f["timestamp"] for f in frames],
+            )
+            satellite_tensor = preprocessed.get("satellite_tensor")
+            hard_mask_tensor = preprocessed.get("hard_mask_tensor")
+
     try:
         output_tensor = await state.batch_scheduler.submit(
             input_tensor,
+            satellite_tensor=satellite_tensor,
+            hard_mask_tensor=hard_mask_tensor,
             meta={"radar_id": frames[0]["radar_id"]},
         )
     except RuntimeError as e:
@@ -229,6 +331,7 @@ async def preview_prediction_sequence(
 async def preview_prediction_frame(
     frame_idx: int,
     files: List[str] = Query(..., description="List of input radar file paths"),
+    satellite_files: List[str] = Query(None, description="List of input satellite file paths"),
     state: AppState = Depends(get_app_state),
 ):
     for f in files:
@@ -243,9 +346,36 @@ async def preview_prediction_frame(
     if input_tensor is None:
         raise HTTPException(status_code=400, detail="Insufficient input frames")
 
+    satellite_tensor = None
+    hard_mask_tensor = None
+
+    if satellite_files and state.use_satellite:
+        for f in satellite_files:
+            if not os.path.exists(f):
+                raise HTTPException(status_code=404, detail=f"Satellite file not found: {f}")
+
+        satellite_frames = []
+        for f in satellite_files:
+            try:
+                data = state.fy4_parser.parse_file(f)
+                satellite_frames.append(data)
+            except Exception:
+                continue
+
+        if satellite_frames and state.fy4_preprocessor is not None:
+            preprocessed = state.fy4_preprocessor.preprocess_for_fusion(
+                satellite_frames,
+                target_seq_len=state.tensor_builder.input_seq_len,
+                reference_times=[f["timestamp"] for f in frames],
+            )
+            satellite_tensor = preprocessed.get("satellite_tensor")
+            hard_mask_tensor = preprocessed.get("hard_mask_tensor")
+
     try:
         output_tensor = await state.batch_scheduler.submit(
             input_tensor,
+            satellite_tensor=satellite_tensor,
+            hard_mask_tensor=hard_mask_tensor,
             meta={"radar_id": frames[0]["radar_id"]},
         )
     except RuntimeError as e:

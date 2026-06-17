@@ -2,13 +2,11 @@
 核心服务依赖 - 模型、解析器、渲染器、推理调度器的单例管理
 
 重构要点:
-  1. 将 WeatherRadarPredictor 替换为 DynamicBatchScheduler
-  2. 推理不再直接调用 model.forward(), 而是通过 submit() 提交到批处理队列
-  3. 所有推理请求经过 TensorStandardizer 标准化后统一尺寸
-  4. GPUMemoryManager 负责推理前后的显存管理
+  1. 使用 MultimodalConvLSTM 替换原有 ConvLSTMModel
+  2. 新增 FY-4 卫星解析器和预处理器
+  3. 所有推理请求通过 batch_scheduler.submit(radar, satellite, mask) 异步提交
 """
 import os
-import asyncio
 from typing import Optional
 
 import torch
@@ -20,7 +18,9 @@ from ..preprocessing.normalizer import RadarDataNormalizer
 from ..preprocessing.dataloader import RadarDataLoader
 from ..preprocessing.tensor_builder import TensorSequenceBuilder
 from ..preprocessing.tensor_standardizer import TensorStandardizer
-from ..models.convlstm_model import ConvLSTMModel
+from ..satellite.fy4_parser import FY4DataParser
+from ..satellite.preprocessor import SatellitePreprocessor
+from ..models.multimodal_fusion import MultimodalConvLSTM, FusionMode
 from ..visualization.renderer import RadarImageRenderer
 from ..inference.gpu_manager import GPUMemoryManager
 from ..inference.batch_scheduler import DynamicBatchScheduler
@@ -35,7 +35,9 @@ class AppState:
         self.dataloader: Optional[RadarDataLoader] = None
         self.tensor_builder: Optional[TensorSequenceBuilder] = None
         self.standardizer: Optional[TensorStandardizer] = None
-        self.model: Optional[ConvLSTMModel] = None
+        self.fy4_parser: Optional[FY4DataParser] = None
+        self.fy4_preprocessor: Optional[SatellitePreprocessor] = None
+        self.model: Optional[MultimodalConvLSTM] = None
         self.gpu_manager: Optional[GPUMemoryManager] = None
         self.batch_scheduler: Optional[DynamicBatchScheduler] = None
         self.renderer: Optional[RadarImageRenderer] = None
@@ -58,7 +60,15 @@ class AppState:
             target_width=self.config.get("model", {}).get("img_width", 256),
         )
 
+        self.fy4_parser = FY4DataParser(self.config)
+        self.fy4_preprocessor = SatellitePreprocessor(
+            target_height=self.config.get("model", {}).get("img_height", 256),
+            target_width=self.config.get("model", {}).get("img_width", 256),
+            radar_range_km=self.config.get("radar", {}).get("max_range_km", 460),
+        )
+
         model_cfg = self.config.get("model", {})
+        fusion_cfg = self.config.get("fusion", {})
         gpu_cfg = self.config.get("gpu", {})
 
         if gpu_cfg.get("device", "auto") == "auto":
@@ -67,8 +77,12 @@ class AppState:
             device_str = gpu_cfg.get("device", "cpu")
         self.device = torch.device(device_str)
 
-        self.model = ConvLSTMModel(
-            input_channels=model_cfg.get("input_channels", 2),
+        self.use_satellite = fusion_cfg.get("enabled", True)
+        self.fusion_mode = fusion_cfg.get("mode", FusionMode.HARD_MASK)
+
+        self.model = MultimodalConvLSTM(
+            radar_channels=model_cfg.get("input_channels", 2),
+            satellite_channels=fusion_cfg.get("satellite_channels", 2),
             hidden_channels=model_cfg.get("hidden_channels", [64, 64, 64]),
             kernel_size=model_cfg.get("kernel_size", 3),
             num_layers=model_cfg.get("num_layers", 3),
@@ -76,18 +90,11 @@ class AppState:
             output_seq_len=model_cfg.get("output_seq_len", 12),
             img_height=model_cfg.get("img_height", 256),
             img_width=model_cfg.get("img_width", 256),
+            fusion_mode=self.fusion_mode,
+            use_satellite=self.use_satellite,
         ).to(self.device)
 
-        checkpoint_path = model_cfg.get("checkpoint_path", "./checkpoints/convlstm_weather.pth")
-        if os.path.exists(checkpoint_path):
-            try:
-                checkpoint = torch.load(checkpoint_path, map_location=self.device)
-                if "model_state_dict" in checkpoint:
-                    self.model.load_state_dict(checkpoint["model_state_dict"])
-                else:
-                    self.model.load_state_dict(checkpoint)
-            except Exception:
-                pass
+        self._load_checkpoint()
         self.model.eval()
 
         self.gpu_manager = GPUMemoryManager(self.config)
@@ -105,6 +112,44 @@ class AppState:
         os.makedirs(os.path.join(base_dir, "checkpoints"), exist_ok=True)
 
         self._initialized = True
+
+    def _load_checkpoint(self):
+        fusion_cfg = self.config.get("fusion", {})
+        model_cfg = self.config.get("model", {})
+
+        multimodal_checkpoint = fusion_cfg.get(
+            "checkpoint_path", "./checkpoints/multimodal_convlstm.pth"
+        )
+        if os.path.exists(multimodal_checkpoint):
+            try:
+                checkpoint = torch.load(multimodal_checkpoint, map_location=self.device)
+                if "model_state_dict" in checkpoint:
+                    self.model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+                else:
+                    self.model.load_state_dict(checkpoint, strict=False)
+                return
+            except Exception:
+                pass
+
+        radar_checkpoint = model_cfg.get(
+            "checkpoint_path", "./checkpoints/convlstm_weather.pth"
+        )
+        if os.path.exists(radar_checkpoint):
+            try:
+                checkpoint = torch.load(radar_checkpoint, map_location=self.device)
+                if "model_state_dict" in checkpoint:
+                    state_dict = checkpoint["model_state_dict"]
+                else:
+                    state_dict = checkpoint
+
+                encoder_keys = {}
+                for k, v in state_dict.items():
+                    if "encoder_layers" in k or "decoder_layers" in k or "output_conv" in k:
+                        encoder_keys[k] = v
+
+                self.model.load_state_dict(encoder_keys, strict=False)
+            except Exception:
+                pass
 
     async def start_scheduler(self):
         if self.batch_scheduler is not None:
