@@ -1,5 +1,10 @@
 """
 核心业务服务编排 - 串联解析、预处理、预测、可视化全流程
+
+重构要点:
+  1. 推理调用改为通过 BatchScheduler 异步提交
+  2. 所有输入张量经 TensorStandardizer 标准化
+  3. 命令行模式直接使用 GPUMemoryManager + model 推理
 """
 import os
 from datetime import datetime, timedelta
@@ -13,7 +18,9 @@ from .radar_parser.coordinates import PolarToCartesian
 from .preprocessing.normalizer import RadarDataNormalizer
 from .preprocessing.dataloader import RadarDataLoader
 from .preprocessing.tensor_builder import TensorSequenceBuilder
-from .models.convlstm_model import WeatherRadarPredictor
+from .preprocessing.tensor_standardizer import TensorStandardizer
+from .models.convlstm_model import ConvLSTMModel
+from .inference.gpu_manager import GPUMemoryManager
 from .visualization.renderer import RadarImageRenderer
 
 
@@ -31,8 +38,74 @@ class WeatherRadarService:
         self.normalizer = RadarDataNormalizer(self.config.get("preprocessing", {}))
         self.dataloader = RadarDataLoader(self.config)
         self.tensor_builder = TensorSequenceBuilder(self.config)
-        self.predictor = WeatherRadarPredictor(self.config)
+        self.standardizer = TensorStandardizer(
+            target_height=self.config.get("model", {}).get("img_height", 256),
+            target_width=self.config.get("model", {}).get("img_width", 256),
+        )
+        self.gpu_manager = GPUMemoryManager(self.config)
         self.renderer = RadarImageRenderer(self.config)
+
+        model_cfg = self.config.get("model", {})
+        gpu_cfg = self.config.get("gpu", {})
+
+        if gpu_cfg.get("device", "auto") == "auto":
+            device_str = "cuda" if torch.cuda.is_available() else "cpu"
+        else:
+            device_str = gpu_cfg.get("device", "cpu")
+        self.device = torch.device(device_str)
+
+        self.model = ConvLSTMModel(
+            input_channels=model_cfg.get("input_channels", 2),
+            hidden_channels=model_cfg.get("hidden_channels", [64, 64, 64]),
+            kernel_size=model_cfg.get("kernel_size", 3),
+            num_layers=model_cfg.get("num_layers", 3),
+            input_seq_len=model_cfg.get("input_seq_len", 24),
+            output_seq_len=model_cfg.get("output_seq_len", 12),
+            img_height=model_cfg.get("img_height", 256),
+            img_width=model_cfg.get("img_width", 256),
+        ).to(self.device)
+
+        checkpoint_path = model_cfg.get("checkpoint_path", "./checkpoints/convlstm_weather.pth")
+        if os.path.exists(checkpoint_path):
+            try:
+                checkpoint = torch.load(checkpoint_path, map_location=self.device)
+                if "model_state_dict" in checkpoint:
+                    self.model.load_state_dict(checkpoint["model_state_dict"])
+                else:
+                    self.model.load_state_dict(checkpoint)
+            except Exception:
+                pass
+        self.model.eval()
+
+    def _safe_predict(self, input_tensor: torch.Tensor) -> torch.Tensor:
+        standardized, meta = self.standardizer.standardize_tensor(input_tensor)
+
+        estimated_mb = self.gpu_manager.estimate_batch_memory_mb(
+            batch_size=standardized.size(0),
+            seq_len=standardized.size(1),
+            channels=standardized.size(2),
+            height=standardized.size(3),
+            width=standardized.size(4),
+            num_layers=len(self.model.encoder_layers),
+        )
+
+        if not self.gpu_manager.can_allocate(estimated_mb):
+            self.gpu_manager.post_inference_cleanup()
+            if not self.gpu_manager.can_allocate(estimated_mb):
+                raise RuntimeError(
+                    f"GPU OOM: cannot allocate {estimated_mb:.0f}MB. "
+                    f"Free: {self.gpu_manager.get_stats().free_mb:.0f}MB"
+                )
+
+        with self.gpu_manager.safe_inference_context():
+            standardized = standardized.to(self.device)
+            with torch.no_grad():
+                self.model.eval()
+                output = self.model(standardized)
+            output = output.cpu()
+
+        restored = self.standardizer.restore_tensor(output, meta)
+        return restored
 
     def process_files(
         self,
@@ -81,8 +154,12 @@ class WeatherRadarService:
             )
             return result
 
-        with torch.no_grad():
-            output_tensor = self.predictor.predict(input_tensor)
+        try:
+            output_tensor = self._safe_predict(input_tensor)
+        except RuntimeError as e:
+            result["success"] = False
+            result["error"] = str(e)
+            return result
 
         denormalized = self.tensor_builder.denormalize_output(output_tensor, var_name="Z")
 
@@ -176,7 +253,11 @@ class WeatherRadarService:
         if input_tensor is None:
             return None
 
-        output_tensor = self.predictor.predict(input_tensor)
+        try:
+            output_tensor = self._safe_predict(input_tensor)
+        except RuntimeError:
+            return None
+
         denormalized = self.tensor_builder.denormalize_output(output_tensor, var_name="Z")
 
         if frame_index < 0 or frame_index >= len(denormalized):

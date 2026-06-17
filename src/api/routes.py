@@ -1,10 +1,16 @@
 """
 FastAPI 路由端点 - 雷达数据上传、预测、预览接口
+
+重构要点:
+  1. 所有推理请求通过 batch_scheduler.submit() 异步提交
+  2. 输入张量先经 standardizer 标准化再提交，消除尺寸差异
+  3. 推理结果通过 await future 获取，天然支持背压
+  4. GPU 显存管理由 scheduler 内部自动处理
 """
+import asyncio
 import os
-import tempfile
 from datetime import datetime, timedelta
-from typing import List, Optional
+from typing import List
 
 from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, Query
 from fastapi.responses import Response, StreamingResponse
@@ -23,12 +29,20 @@ router = APIRouter()
 
 @router.get("/health", response_model=HealthResponse)
 async def health_check(state: AppState = Depends(get_app_state)):
+    scheduler_stats = state.batch_scheduler.get_stats() if state.batch_scheduler else {}
     return HealthResponse(
         status="ok",
         model_loaded=state.is_model_loaded,
-        device=state.device,
+        device=state.device_str,
         version="1.0.0",
     )
+
+
+@router.get("/stats")
+async def inference_stats(state: AppState = Depends(get_app_state)):
+    if state.batch_scheduler is None:
+        raise HTTPException(status_code=503, detail="Scheduler not initialized")
+    return state.batch_scheduler.get_stats()
 
 
 @router.post("/upload", response_model=RadarUploadResponse)
@@ -84,7 +98,18 @@ async def predict(
             detail=f"Insufficient frames. Need at least {state.tensor_builder.input_seq_len}",
         )
 
-    output_tensor = state.predictor.predict(input_tensor)
+    try:
+        output_tensor = await state.batch_scheduler.submit(
+            input_tensor,
+            meta={"radar_id": frames[0]["radar_id"]},
+        )
+    except RuntimeError as e:
+        error_msg = str(e)
+        if "OOM" in error_msg or "out of memory" in error_msg.lower() or "memory pressure" in error_msg.lower():
+            raise HTTPException(status_code=503, detail=error_msg)
+        raise HTTPException(status_code=500, detail=error_msg)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Inference request timed out")
 
     output_seq_len = state.tensor_builder.output_seq_len
     interval = state.config.get("prediction", {}).get("interval_minutes", 10)
@@ -157,7 +182,14 @@ async def preview_prediction_sequence(
     if input_tensor is None:
         raise HTTPException(status_code=400, detail="Insufficient input frames")
 
-    output_tensor = state.predictor.predict(input_tensor)
+    try:
+        output_tensor = await state.batch_scheduler.submit(
+            input_tensor,
+            meta={"radar_id": frames[0]["radar_id"]},
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
     denormalized = state.tensor_builder.denormalize_output(output_tensor, var_name="Z")
 
     interval = state.config.get("prediction", {}).get("interval_minutes", 10)
@@ -211,7 +243,14 @@ async def preview_prediction_frame(
     if input_tensor is None:
         raise HTTPException(status_code=400, detail="Insufficient input frames")
 
-    output_tensor = state.predictor.predict(input_tensor)
+    try:
+        output_tensor = await state.batch_scheduler.submit(
+            input_tensor,
+            meta={"radar_id": frames[0]["radar_id"]},
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
     denormalized = state.tensor_builder.denormalize_output(output_tensor, var_name="Z")
 
     if frame_idx < 0 or frame_idx >= len(denormalized):

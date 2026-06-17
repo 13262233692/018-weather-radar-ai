@@ -37,6 +37,18 @@ prediction:
   horizon_hours: 2
   interval_minutes: 10
 
+gpu:
+  device: "auto"
+  high_watermark_ratio: 0.85
+  low_watermark_ratio: 0.60
+  enable_memory_pool: true
+  max_batch_memory_mb: 4096
+
+batch_scheduler:
+  max_batch_size: 8
+  max_wait_ms: 50
+  max_queue_size: 64
+
 service:
   host: "0.0.0.0"
   port: 8000
