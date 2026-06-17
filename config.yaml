@@ -1,0 +1,50 @@
+radar:
+  data_format: "binary"
+  polar_variables:
+    - "Z"
+    - "ZDR"
+    - "PHIDP"
+    - "RHOHV"
+  elevation_count: 9
+  max_range_km: 460
+  radial_count: 360
+  gate_count: 920
+
+model:
+  name: "ConvLSTM"
+  input_channels: 2
+  hidden_channels: [64, 64, 64]
+  kernel_size: 3
+  num_layers: 3
+  input_seq_len: 24
+  output_seq_len: 12
+  img_height: 256
+  img_width: 256
+  checkpoint_path: "./checkpoints/convlstm_weather.pth"
+
+preprocessing:
+  grid_size: 256
+  normalization:
+    Z:
+      min: -30
+      max: 75
+    ZDR:
+      min: -2
+      max: 8
+  time_interval_minutes: 5
+
+prediction:
+  horizon_hours: 2
+  interval_minutes: 10
+
+service:
+  host: "0.0.0.0"
+  port: 8000
+  preview_endpoint: "/api/radar/preview"
+  predict_endpoint: "/api/radar/predict"
+  upload_endpoint: "/api/radar/upload"
+
+visualization:
+  colormap: "weather"
+  dpi: 100
+  format: "png"
